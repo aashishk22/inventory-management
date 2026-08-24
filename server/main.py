@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Optional
+from datetime import datetime, timedelta
 from pydantic import BaseModel
 from mock_data import inventory_items, orders, demand_forecasts, backlog_items, spending_summary, monthly_spending, category_spending, recent_transactions, purchase_orders
 
@@ -89,6 +90,42 @@ class DemandForecast(BaseModel):
     forecasted_demand: int
     trend: str
     period: str
+    unit_cost: float
+    lead_time_days: int
+
+
+class RestockOrderItem(BaseModel):
+    item_sku: str
+    item_name: str
+    quantity: int
+    unit_cost: float
+    lead_time_days: int
+    line_total: float
+
+
+class RestockOrder(BaseModel):
+    id: str
+    order_number: str
+    items: List[RestockOrderItem]
+    total_value: float
+    budget: float
+    status: str
+    submitted_date: str
+    # Lead time for the order as a whole is the slowest line item: the order is
+    # only complete once every item has arrived.
+    lead_time_days: int
+    expected_delivery: str
+
+
+class CreateRestockOrderRequest(BaseModel):
+    items: List[RestockOrderItem]
+    budget: float
+
+
+# Submitted restocking orders live only in this process, matching how every
+# other dataset here works: there is no write-back to server/data/, so the
+# list empties on restart.
+submitted_restock_orders: List["RestockOrder"] = []
 
 class BacklogItem(BaseModel):
     id: str
@@ -303,6 +340,54 @@ def get_monthly_trends():
     result = list(months.values())
     result.sort(key=lambda x: x['month'])
     return result
+
+@app.get("/api/restock-orders", response_model=List[RestockOrder])
+def get_restock_orders():
+    """Get all submitted restocking orders, newest first."""
+    return list(reversed(submitted_restock_orders))
+
+
+@app.post("/api/restock-orders", response_model=RestockOrder, status_code=201)
+def create_restock_order(request: CreateRestockOrderRequest):
+    """Submit a restocking order built on the Restocking tab."""
+    if not request.items:
+        raise HTTPException(
+            status_code=400,
+            detail="A restocking order must contain at least one item"
+        )
+
+    total_value = round(sum(item.line_total for item in request.items), 2)
+
+    if total_value > request.budget:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Order total {total_value} exceeds budget {request.budget}"
+        )
+
+    # The order is only fulfilled once its slowest line item lands, so the
+    # order-level lead time is the max across items rather than a sum or mean.
+    lead_time_days = max(item.lead_time_days for item in request.items)
+    submitted_date = datetime.now()
+
+    order = RestockOrder(
+        # Sequence off the list length; ids restart at 1 whenever the process
+        # does, which is consistent with every other dataset here.
+        id=str(len(submitted_restock_orders) + 1),
+        order_number=f"RST-{submitted_date.year}-{len(submitted_restock_orders) + 1:04d}",
+        items=request.items,
+        total_value=total_value,
+        budget=request.budget,
+        status="Submitted",
+        submitted_date=submitted_date.isoformat(timespec="seconds"),
+        lead_time_days=lead_time_days,
+        expected_delivery=(
+            submitted_date + timedelta(days=lead_time_days)
+        ).isoformat(timespec="seconds"),
+    )
+
+    submitted_restock_orders.append(order)
+    return order
+
 
 if __name__ == "__main__":
     import uvicorn
